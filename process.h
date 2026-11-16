@@ -1,3 +1,4 @@
+/* smdbg fork modifications, 2026-11-16: see CHANGELOG.md. */
 /*
  * Process packets header
  * Copyright (C) 2011 Unix Solutions Ltd.
@@ -18,6 +19,7 @@
 void *decode_thread(void *_ts);
 void *write_thread(void *_ts);
 void process_packets(struct ts *ts, uint8_t *data, ssize_t data_len);
+int output_raw_packets(struct ts *ts, uint8_t *data, unsigned int data_size);
 void show_pid_report(struct ts *ts);
 
 #endif

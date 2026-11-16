@@ -1,3 +1,4 @@
+/* smdbg fork modifications, 2026-11-16: see CHANGELOG.md. */
 /*
  * cs378x protocol
  * Copyright (C) 2011 Unix Solutions Ltd.
@@ -142,6 +143,15 @@ READ:
 	// EMM request, ignore it. Sometimes OSCAM sends two EMM requests after CW
 	if (data[0] == 0x05)
 		goto READ;
+
+	/* OSCam may announce its extended mode before the pending CW reply.
+	 * We do not negotiate that mode: keep reading the legacy CW response
+	 * for this request instead of leaving it queued for the next ECM.
+	 */
+	if (data[0] == 0x50) {
+		ts_LOGf("CAM | [%s] Ignoring extended-mode announcement (0x50); waiting for CW.\n", c->ops.ident);
+		goto READ;
+	}
 
 	if (data[0] != 0x01) {
 		ts_LOGf("ERR | [%s] Unexpected server response on code word request (ret data[0] == 0x%02x /%s/)\n",

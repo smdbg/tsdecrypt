@@ -5,6 +5,13 @@ decrypts it using code words obtained from OSCAM or similar cam
 server. tsdecrypt communicates with CAM server using cs378x (camd35
 over tcp) protocol or newcamd protocol.
 
+Standalone fork
+===============
+This fork is maintained at https://github.com/smdbg/tsdecrypt.
+It adds the cs378x 0x50 fix and a bounded native whole-input RAM shift.
+Read README.md, CHANGELOG.md and docs/RAM_INPUT_SHIFT.md for fork details.
+The installed command-line reference is tsdecrypt.1 (man tsdecrypt).
+
 License
 =======
 tsdecrypt is released under GNU GPL v2.
@@ -62,35 +69,24 @@ version string. You can use --bench option to test decryption speed.
 
 Development
 ===========
-The development is done using git. tsdecrypt repository is hosted
-at https://georgi.unixsol.org/git/gfto/tsdecrypt
+Upstream: https://github.com/gfto/tsdecrypt
+This fork: https://github.com/smdbg/tsdecrypt
 
-To clone the repository issue the following commands:
-
-   git clone https://georgi.unixsol.org/gfto/tsdecrypt.git
+   git clone https://github.com/smdbg/tsdecrypt.git
    cd tsdecrypt
-   git submodule init
-   git submodule update
    make
 
-The code is developed and tested under modern Linux. It is also
-compiled from time to time under OS X but is not tested there.
-
-To see all Makefile targets run 'make help'.
+libfuncs and libtsfuncs are included at pinned revisions; no submodule download
+is needed. See docs/PROVENANCE.md. This fork and its RAM shift are tested on
+Linux; portability to other operating systems has not been validated.
 
 Updating the code
 =================
-To update cloned tsdecrypt, go to the directory where the repository
-is cloned and run the following commands:
+From a clean checkout:
 
-   git fetch origin
-   git merge origin/master
-   git submodule update
-   make clean all
-
-tsdecrypt's master branch should always be useful so it is safe to
-use it instead of official release. The master branch will always
-be better than any released version.
+   git pull --ff-only
+   make clean
+   make
 
 Command line parameters
 =======================
@@ -117,6 +113,10 @@ Input options:
  -z --input-ignore-disc     | Do not report discontinuty errors in input.
  -M --input-service <srvid> | Choose service id when input is MPTS.
  -T --input-buffer <ms>     | Set input buffer time in ms. Default: 0
+    --input-shift <ms>      | Delay whole input BEFORE ECM processing (0..10000).
+    --input-shift-memory <B>| Per-process queue cap in bytes; required with shift.
+    --input-shift-status <f>| Atomic JSON queue counters; prefer a tmpfs path.
+    --input-passthrough     | Forward complete TS without CAMD or decryption.
  -W --input-dump <filename> | Save input stream in file.
 
 Output options:

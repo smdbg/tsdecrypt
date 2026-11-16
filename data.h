@@ -1,3 +1,4 @@
+/* smdbg fork modifications, 2026-11-16: see CHANGELOG.md. */
 /*
  * Data definitions
  * Copyright (C) 2011 Unix Solutions Ltd.
@@ -375,6 +376,10 @@ struct ts {
 
 	unsigned int		input_buffer_time;
 	LIST				*input_buffer;
+	unsigned int		input_shift_ms;
+	size_t				input_shift_memory;
+	char				*input_shift_status;
+	int					input_passthrough;
 
 	int					emm_filters_num;
 	struct filter		emm_filters[MAX_FILTERS];

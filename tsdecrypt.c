@@ -1,3 +1,4 @@
+/* smdbg fork modifications, 2026-11-16: see CHANGELOG.md. */
 /*
  * tsdecrypt
  * Copyright (C) 2011-2012 Unix Solutions Ltd.
@@ -23,6 +24,8 @@
 #include <errno.h>
 #include <syslog.h>
 #include <sys/resource.h>
+#include <poll.h>
+#include <limits.h>
 
 #include "libfuncs/libfuncs.h"
 
@@ -34,6 +37,7 @@
 #include "udp.h"
 #include "notify.h"
 #include "filter.h"
+#include "input-shift.h"
 
 #define FIRST_REPORT_SEC 3
 
@@ -79,6 +83,8 @@ static void LOG_func(const char *msg) {
 
 static const char short_options[] = "i:d:N:90:Sl:L:F:I:1:RzM:T:W:O:o:t:rk:g:upwx3yc:C:Y:Q:A:s:U:P:B:46eZ:Ef:a:X:vqH:G:2:KJ:D:jbhVn:m:";
 
+enum { OPT_INPUT_SHIFT = 1000, OPT_INPUT_SHIFT_MEMORY, OPT_INPUT_SHIFT_STATUS, OPT_INPUT_PASSTHROUGH };
+
 // Unused short options: 578
 static const struct option long_options[] = {
 	{ "ident",				required_argument, NULL, 'i' },
@@ -97,6 +103,10 @@ static const struct option long_options[] = {
 	{ "input-ignore-disc",	no_argument,       NULL, 'z' },
 	{ "input-service",		required_argument, NULL, 'M' },
 	{ "input-buffer",		required_argument, NULL, 'T' },
+	{ "input-shift",         required_argument, NULL, OPT_INPUT_SHIFT },
+	{ "input-shift-memory",  required_argument, NULL, OPT_INPUT_SHIFT_MEMORY },
+	{ "input-shift-status",  required_argument, NULL, OPT_INPUT_SHIFT_STATUS },
+	{ "input-passthrough",   no_argument,       NULL, OPT_INPUT_PASSTHROUGH },
 	{ "input-dump",			required_argument, NULL, 'W' },
 
 	{ "output",				required_argument, NULL, 'O' },
@@ -178,6 +188,10 @@ static void show_help(struct ts *ts) {
 	printf(" -z --input-ignore-disc     | Do not report discontinuty errors in input.\n");
 	printf(" -M --input-service <srvid> | Choose service id when input is MPTS.\n");
 	printf(" -T --input-buffer <ms>     | Set input buffer time in ms. Default: %u\n", ts->input_buffer_time);
+	printf("    --input-shift <ms>      | Delay whole input BEFORE ECM processing (0..10000). Default: 0\n");
+	printf("    --input-shift-memory <B>| Hard RAM queue cap in bytes (required with nonzero shift).\n");
+	printf("    --input-shift-status <f>| Atomic JSON queue counters, every 10 seconds; use tmpfs.\n");
+	printf("    --input-passthrough    | Forward whole TS unchanged; no CAMD, parsing or decryption.\n");
 	printf(" -W --input-dump <filename> | Save input stream in file.\n");
 	printf("\n");
 	printf("Output options:\n");
@@ -285,6 +299,11 @@ static void show_help(struct ts *ts) {
 
 static int parse_io_param(struct io *io, char *opt, int open_flags, mode_t open_mode) {
 	int port_set = 0, host_set;
+	if (strcmp(opt, "-") == 0) {
+		io->type = FILE_IO;
+		io->fd = (open_flags & O_WRONLY) ? STDOUT_FILENO : STDIN_FILENO;
+		return 1;
+	}
 	io->type = WTF_IO;
 	if (strstr(opt, "file://") == opt) {
 		io->fname = opt + 7; // strlen("file://")
@@ -304,6 +323,21 @@ static int parse_io_param(struct io *io, char *opt, int open_flags, mode_t open_
 	io->type = NET_IO;
 	host_set = parse_host_and_port(opt, &io->hostname, &io->service, &port_set);
 	return !(!port_set || !host_set);
+}
+
+static unsigned long long parse_unsigned(const char *value, unsigned long long maximum, const char *option) {
+	char *end;
+	unsigned long long result;
+	if (!*value || strspn(value, "0123456789") != strlen(value))
+		goto invalid;
+	errno = 0;
+	result = strtoull(value, &end, 10);
+	if (errno || *end || result > maximum)
+		goto invalid;
+	return result;
+invalid:
+	fprintf(stderr, "ERROR: %s requires an integer from 0 to %llu.\n", option, maximum);
+	exit(EXIT_FAILURE);
 }
 
 static void parse_options(struct ts *ts, int argc, char **argv) {
@@ -365,6 +399,18 @@ static void parse_options(struct ts *ts, int argc, char **argv) {
 				break;
 			case 'T': // --input-buffer
 				ts->input_buffer_time = strtoul(optarg, NULL, 0);
+				break;
+			case OPT_INPUT_SHIFT:
+				ts->input_shift_ms = parse_unsigned(optarg, INPUT_SHIFT_MAX_MS, "--input-shift");
+				break;
+			case OPT_INPUT_SHIFT_MEMORY:
+				ts->input_shift_memory = parse_unsigned(optarg, SIZE_MAX, "--input-shift-memory");
+				break;
+			case OPT_INPUT_SHIFT_STATUS:
+				ts->input_shift_status = optarg;
+				break;
+			case OPT_INPUT_PASSTHROUGH:
+				ts->input_passthrough = 1;
 				break;
 			case 'W': // --input-dump
 				ts->input_dump_filename = optarg;
@@ -623,6 +669,25 @@ static void parse_options(struct ts *ts, int argc, char **argv) {
 				exit(EXIT_SUCCESS);
 		}
 	}
+	if (ts->input_shift_ms && ts->input_shift_memory < 4096) {
+		fprintf(stderr, "ERROR: Nonzero --input-shift requires --input-shift-memory of at least 4096 bytes.\n");
+		exit(EXIT_FAILURE);
+	}
+	if (ts->input_shift_ms && packet_from_file) {
+		fprintf(stderr, "ERROR: --input-shift requires transport-stream input, not a single ECM/EMM file.\n");
+		exit(EXIT_FAILURE);
+	}
+	if (ts->input_passthrough) {
+		if (packet_from_file || ts->input_buffer_time || ts->camd.constant_codeword || ts->process_emm) {
+			fprintf(stderr, "ERROR: --input-passthrough cannot be combined with ECM/EMM file, --input-buffer, constant CW or --emm.\n");
+			exit(EXIT_FAILURE);
+		}
+		ts->process_ecm = 0;
+		ts->process_emm = 0;
+		ts->pid_filter = 0;
+		ts->threaded = 0;
+		server_err = 0;
+	}
 	if (!ts->ident) {
 		if (ts->syslog_active || ts->notify_program || ts->status_file)
 			ident_err = 1;
@@ -682,7 +747,7 @@ static void parse_options(struct ts *ts, int argc, char **argv) {
 		fprintf(stderr, "ERROR: Invalid hex string for des key: %s\n", ts->camd.newcamd.hex_des_key);
 		exit(EXIT_FAILURE);
 	}
-	if (ts->camd.ops.proto == CAMD_NEWCAMD && !port_set) {
+	if (!ts->input_passthrough && ts->camd.ops.proto == CAMD_NEWCAMD && !port_set) {
 		fprintf(stderr, "ERROR: CAMD server port is not set. Use --camd-server %s:xxxx to set the port.\n", ts->camd.hostname);
 		exit(EXIT_FAILURE);
 	}
@@ -713,7 +778,7 @@ static void parse_options(struct ts *ts, int argc, char **argv) {
 			ts_LOGf("Syslog     : disabled\n");
 	}
 
-	if (!ts->camd.constant_codeword) {
+	if (!ts->input_passthrough && !ts->camd.constant_codeword) {
 		if (ts->forced_caid)
 			ts->req_CA_sys = ts_get_CA_sys(ts->forced_caid);
 		if (!ts->forced_caid)
@@ -722,7 +787,7 @@ static void parse_options(struct ts *ts, int argc, char **argv) {
 			ts_LOGf("CA System  : %s | CAID: 0x%04x (%d)\n",
 				ts_get_CA_sys_txt(ts->req_CA_sys),
 				ts->forced_caid, ts->forced_caid);
-	} else {
+	} else if (!ts->input_passthrough) {
 		char cw_even[64], cw_odd[64];
 		ts_hex_dump_buf(cw_even, sizeof(cw_even), ts->key.cw    , 8, 0);
 		ts_hex_dump_buf(cw_odd , sizeof(cw_odd ), ts->key.cw + 8, 8, 0);
@@ -792,13 +857,13 @@ static void parse_options(struct ts *ts, int argc, char **argv) {
 				ts_LOGf("Out filter : Pass through TDT/TOT.\n");
 		}
 		ts_LOGf("TS discont : %s\n", ts->ts_discont ? "report" : "ignore");
-		ts->threaded = !(ts->input.type == FILE_IO && ts->input.fd != 0);
-		ts_LOGf("Decoding   : %s\n", ts->threaded ? "threaded" : "single thread");
+		ts->threaded = !ts->input_passthrough && !(ts->input.type == FILE_IO && ts->input.fd != 0);
+		ts_LOGf("Decoding   : %s\n", ts->input_passthrough ? "disabled (whole-input passthrough)" : ts->threaded ? "threaded" : "single thread");
 	} else {
 		ts_LOGf("Decoding   : disabled\n");
 	}
 
-	if (!ts->camd.constant_codeword) {
+	if (!ts->input_passthrough && !ts->camd.constant_codeword) {
 		ts_LOGf("CAMD proto : %s\n", ts->camd.ops.ident);
 		ts_LOGf("CAMD addr  : %s:%s%s\n", ts->camd.hostname, ts->camd.service,
 			ai_family == AF_INET  ? " (IPv4 only)" :
@@ -962,6 +1027,10 @@ void signal_quit(int sig) {
 		shutdown_fd(&ts.input.fd);
 	if (ts.output.type == NET_IO)
 		shutdown_fd(&ts.output.fd);
+	/* An outstanding ECM reply must not hold shutdown beyond the shift queue.
+	 * Leave descriptor ownership to camd_stop; only wake its blocking receive. */
+	if (ts.camd.server_fd >= 0)
+		shutdown(ts.camd.server_fd, SHUT_RDWR);
 	signal(sig, SIG_DFL);
 }
 
@@ -975,6 +1044,212 @@ void signal_alarm(int sig) {
 static uint8_t ts_packet[FRAME_SIZE + RTP_HDR_SZ];
 static uint8_t rtp_hdr[2][RTP_HDR_SZ];
 
+static int shifted_dispatch(struct ts *stream, uint8_t *data, size_t length) {
+	if (stream->input_passthrough)
+		return output_raw_packets(stream, data, length);
+	process_packets(stream, data, length);
+	return 0;
+}
+
+static int shift_status_write(struct ts *stream, const struct input_shift *shift, const char *state) {
+	char temporary[PATH_MAX];
+	FILE *file;
+	int fd, failed;
+	if (!stream->input_shift_status)
+		return 0;
+	if (snprintf(temporary, sizeof(temporary), "%s.%ld.tmp", stream->input_shift_status, (long)getpid()) >= (int)sizeof(temporary))
+		return -1;
+	fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+	if (fd < 0)
+		return -1;
+	file = fdopen(fd, "w");
+	if (!file) {
+		close(fd);
+		unlink(temporary);
+		return -1;
+	}
+	failed = fprintf(file,
+		"{\"pid\":%ld,\"shift_ms\":%u,\"capacity_bytes\":%zu,\"allocated_bytes\":%zu,"
+		"\"used_bytes\":%zu,\"peak_bytes\":%zu,\"queued_bytes\":%zu,"
+		"\"queued_blocks\":%zu,\"capacity_blocks\":%zu,"
+		"\"received_blocks\":%" PRIu64 ",\"released_blocks\":%" PRIu64 ","
+		"\"overflows\":%" PRIu64 ",\"max_late_ms\":%.3f,\"state\":\"%s\",\"updated_at\":%ld}\n",
+		(long)getpid(), stream->input_shift_ms, shift->capacity_bytes, shift->allocated_bytes,
+		input_shift_used(shift), shift->peak_bytes, shift->queued_bytes,
+		shift->count, shift->capacity_blocks, shift->received_blocks, shift->released_blocks,
+		shift->overflows, shift->max_late_ns / 1000000.0, state, (long)time(NULL)) < 0;
+	if (fclose(file) != 0)
+		failed = 1;
+	if (failed || rename(temporary, stream->input_shift_status) != 0) {
+		unlink(temporary);
+		return -1;
+	}
+	return 0;
+}
+
+/* The queue is deliberately BEFORE process_packets: ECM, EMM, tables and A/V
+ * share the same receive-time deadline. No ECM is parsed at enqueue time. */
+static int run_shifted_input(struct ts *stream) {
+	struct input_shift *shift = input_shift_create(stream->input_shift_ms ? stream->input_shift_memory : 4096, stream->input_shift_ms);
+	uint8_t packet[FRAME_SIZE + RTP_HDR_SZ];
+	size_t partial = 0;
+	uint64_t last_input = input_shift_now(), next_status = last_input, next_report = last_input;
+	int eof = 0, result = 0, status_warning = 0;
+	uint16_t last_sequence = 0;
+	int have_sequence = 0;
+	const char *final_state = "stopped";
+	if (!shift) {
+		ts_LOGf("SHIFT | Cannot allocate bounded RAM queue: %s\n", strerror(errno));
+		return -1;
+	}
+	ts_LOGf("SHIFT | Whole input delayed %u ms before ECM; RAM %zu bytes, %zu blocks.\n",
+		stream->input_shift_ms, shift->allocated_bytes, shift->capacity_blocks);
+	while (keep_running && (!eof || shift->count)) {
+		uint64_t now = input_shift_now();
+		struct input_shift_block *block;
+		struct pollfd ready;
+		ssize_t length;
+		size_t complete, i;
+		int polled, drained = 0;
+		/* Bounded work per turn: a delayed scheduler must still service input. */
+		while (drained++ < 64 && (block = input_shift_ready(shift, now))) {
+			if (shifted_dispatch(stream, block->data, block->length) != 0) {
+				ts_LOGf("SHIFT | Output write failed; stopping rather than dropping queued data.\n");
+				result = -1;
+				goto finished;
+			}
+			input_shift_release(shift, now);
+			now = input_shift_now();
+		}
+		if (now >= next_report) {
+			if (!stream->input_passthrough && !stream->camd.constant_codeword)
+				do_reports(stream);
+			next_report = now + 1000000000;
+		}
+		if (now >= next_status) {
+			const char *state = !shift->received_blocks || !shift->released_blocks ? "buffering" : shift->count ? "running" : "idle";
+			if (shift_status_write(stream, shift, state) != 0 && !status_warning) {
+				ts_LOGf("SHIFT | Cannot write queue status: %s\n", strerror(errno));
+				status_warning = 1;
+			}
+			next_status = now + 10000000000ULL;
+		}
+		if (stream->input.type == NET_IO && now - last_input >= 2000000000 && !stream->no_input) {
+			stream->no_input = 1;
+			ts_LOGf("SHIFT | No input for 2 seconds; queued blocks still drain on schedule.\n");
+			notify(stream, "INPUT_TIMEOUT", "No input for 2 seconds; RAM shift remains scheduled.");
+		}
+		if (eof && !shift->count)
+			break;
+		ready.fd = eof ? -1 : stream->input.fd;
+		ready.events = POLLIN;
+		ready.revents = 0;
+		polled = poll(&ready, 1, input_shift_wait_ms(shift, now, 100));
+		if (!keep_running)
+			break;
+		if (polled < 0) {
+			if (errno == EINTR)
+				continue;
+			ts_LOGf("SHIFT | Input poll failed: %s\n", strerror(errno));
+			result = -1;
+			break;
+		}
+		if (!polled)
+			continue;
+		if (ready.revents & POLLNVAL) {
+			ts_LOGf("SHIFT | Input descriptor is invalid.\n");
+			result = -1;
+			break;
+		}
+		if (stream->input.type == NET_IO) {
+			size_t maximum = FRAME_SIZE + (stream->rtp_input ? RTP_HDR_SZ : 0);
+			length = recv(stream->input.fd, packet, maximum, MSG_TRUNC);
+			if (length > (ssize_t)maximum) {
+				ts_LOGf("SHIFT | Oversized UDP input (%zd bytes); expected at most %zu.\n", length, maximum);
+				result = -1;
+				break;
+			}
+		} else {
+			length = read(stream->input.fd, packet + partial, FRAME_SIZE - partial);
+		}
+		if (length < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+				continue;
+			ts_LOGf("SHIFT | Input read failed: %s\n", strerror(errno));
+			result = -1;
+			break;
+		}
+		if (!length) {
+			if (stream->input.type != NET_IO) {
+				eof = 1;
+				if (partial) {
+					ts_LOGf("SHIFT | Truncated TS packet at EOF (%zu bytes).\n", partial);
+					result = -1;
+					break;
+				}
+			}
+			continue;
+		}
+		now = input_shift_now();
+		last_input = now;
+		if (stream->no_input) {
+			stream->no_input = 0;
+			notify(stream, "INPUT_OK", "Input resumed; RAM shift remains scheduled.");
+		}
+		if (stream->input.type == NET_IO && stream->rtp_input) {
+			uint16_t sequence;
+			/* Existing input format is MPEG-TS with the fixed 12-byte RTP header. */
+			if (length <= RTP_HDR_SZ || packet[0] != 0x80 || (packet[1] & 0x7f) != 33) {
+				ts_LOGf("SHIFT | Unsupported RTP header; expected MPEG-TS without extensions or CSRC.\n");
+				result = -1;
+				break;
+			}
+			sequence = ((uint16_t)packet[2] << 8) | packet[3];
+			if (have_sequence && (uint16_t)(last_sequence + 1) != sequence && stream->ts_discont)
+				ts_LOGf("SHIFT | RTP sequence discontinuity: expected %u, got %u.\n", (uint16_t)(last_sequence + 1), sequence);
+			last_sequence = sequence;
+			have_sequence = 1;
+			length -= RTP_HDR_SZ;
+			memmove(packet, packet + RTP_HDR_SZ, length);
+		}
+		complete = (size_t)length + partial;
+		partial = complete % 188;
+		complete -= partial;
+		if (stream->input.type == NET_IO && partial) {
+			ts_LOGf("SHIFT | UDP input length is not a multiple of 188 bytes.\n");
+			result = -1;
+			break;
+		}
+		for (i = 0; i < complete; i += 188) {
+			if (packet[i] != 0x47) {
+				ts_LOGf("SHIFT | Input is not aligned MPEG-TS (missing sync byte).\n");
+				result = -1;
+				goto finished;
+			}
+		}
+		if (complete) {
+			if (stream->input_dump_file)
+				fwrite(packet, complete, 1, stream->input_dump_file);
+			if (input_shift_push(shift, packet, complete, now) != 0) {
+				final_state = shift->overflows ? "overflow" : "error";
+				ts_LOGf("SHIFT | RAM limit reached (%zu bytes, %u ms shift); stopping without overwriting data.\n",
+					shift->capacity_bytes, stream->input_shift_ms);
+				notify(stream, "SHIFT_OVERFLOW", "RAM shift queue exceeded its assigned memory cap.");
+				result = -1;
+				break;
+			}
+		}
+		if (partial)
+			memmove(packet, packet + complete, partial);
+	}
+finished:
+	if (result && strcmp(final_state, "stopped") == 0)
+		final_state = "error";
+	shift_status_write(stream, shift, final_state);
+	input_shift_destroy(shift);
+	return result;
+}
+
 int main(int argc, char **argv) {
 	ssize_t readen;
 	int have_data = 1;
@@ -982,6 +1257,7 @@ int main(int argc, char **argv) {
 	time_t timeout_start = time(NULL);
 	int rtp_hdr_pos = 0, num_packets = 0;
 	struct rlimit rl;
+	int exit_status = EXIT_SUCCESS;
 
 	if (getrlimit(RLIMIT_STACK, &rl) == 0) {
 		if (rl.rlim_cur > THREAD_STACK_SIZE) {
@@ -1017,10 +1293,14 @@ int main(int argc, char **argv) {
 	ts_LOGf("Start %s\n", program_id);
 	notify(&ts, "START", "Starting %s", program_id);
 
-	if (ts.input.type == NET_IO && udp_connect_input(&ts.input) < 1)
+	if (ts.input.type == NET_IO && udp_connect_input(&ts.input) < 1) {
+		exit_status = EXIT_FAILURE;
 		goto EXIT;
-	if (ts.output.type == NET_IO && udp_connect_output(&ts.output) < 1)
+	}
+	if (ts.output.type == NET_IO && udp_connect_output(&ts.output) < 1) {
+		exit_status = EXIT_FAILURE;
 		goto EXIT;
+	}
 
 	signal(SIGCHLD, SIG_IGN);
 	signal(SIGPIPE, SIG_IGN);
@@ -1035,7 +1315,8 @@ int main(int argc, char **argv) {
 
 	ts.emm_last_report = time(NULL) + FIRST_REPORT_SEC;
 	ts.ecm_last_report = time(NULL) + FIRST_REPORT_SEC;
-	camd_start(&ts);
+	if (!ts.input_passthrough)
+		camd_start(&ts);
 
 	if (packet_from_file) {
 		uint8_t tmp[2048];
@@ -1046,8 +1327,20 @@ int main(int argc, char **argv) {
 		goto EXIT;
 	}
 
+	if (ts.input_shift_ms || ts.input_passthrough) {
+		if (run_shifted_input(&ts) != 0) {
+			exit_status = EXIT_FAILURE;
+			/* Fatal queue/read errors must also cancel a pending CAMD reply.
+			 * Otherwise camd_stop can wait for its network timeout before exit. */
+			keep_running = 0;
+			if (ts.camd.server_fd >= 0)
+				shutdown(ts.camd.server_fd, SHUT_RDWR);
+		}
+		goto EXIT;
+	}
+
 	do {
-		if (!ts.camd.constant_codeword)
+		if (!ts.input_passthrough && !ts.camd.constant_codeword)
 			do_reports(&ts);
 
 		if (ts.input.type == NET_IO) {
@@ -1104,11 +1397,15 @@ int main(int argc, char **argv) {
 		if (readen > 0) {
 			if (ts.input_dump_file)
 				fwrite(ts_packet, readen, 1, ts.input_dump_file);
-			process_packets(&ts, ts_packet, readen);
+			if (shifted_dispatch(&ts, ts_packet, readen) != 0) {
+				exit_status = EXIT_FAILURE;
+				break;
+			}
 		}
 	} while (have_data && keep_running);
 EXIT:
-	camd_stop(&ts);
+	if (!ts.input_passthrough)
+		camd_stop(&ts);
 
 	// If pthread_join failes make sure we exit...
 	signal(SIGINT , SIG_DFL);
@@ -1149,5 +1446,5 @@ EXIT:
 	notify_free(&ts.notify);
 	data_free(&ts);
 
-	exit(EXIT_SUCCESS);
+	exit(exit_status);
 }

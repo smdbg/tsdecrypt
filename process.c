@@ -1,3 +1,4 @@
+/* smdbg fork modifications, 2026-11-16: see CHANGELOG.md. */
 /*
  * Process packets
  * Copyright (C) 2011 Unix Solutions Ltd.
@@ -16,9 +17,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/uio.h>
+#include <errno.h>
 
 #include "bitstream.h"
 #include "data.h"
+#include "process.h"
 #include "csa.h"
 #include "tables.h"
 #include "util.h"
@@ -329,10 +332,22 @@ static inline void output_write(struct ts *ts, uint8_t *data, unsigned int data_
 			return;
 	}
 
+	output_raw_packets(ts, data, data_size);
+}
+
+/* Raw forwarding also serves explicit clear-input passthrough, without PMT,
+ * key, output filtering or decrypt work. It never rewrites TS packets. */
+int output_raw_packets(struct ts *ts, uint8_t *data, unsigned int data_size) {
+	ssize_t written;
 	if (!ts->rtp_output) {
-		if (write(ts->output.fd, data, data_size) < 0) {
+		do {
+			written = write(ts->output.fd, data, data_size);
+		} while (written < 0 && errno == EINTR);
+		if (written != (ssize_t)data_size) {
+			if (written >= 0)
+				errno = EIO;
 			perror("write(output_fd)");
-			return;
+			return -1;
 		}
 	} else {
 		struct iovec iov[2];
@@ -361,11 +376,17 @@ static inline void output_write(struct ts *ts, uint8_t *data, unsigned int data_
 		iov[1].iov_base = data;
 		iov[1].iov_len  = data_size;
 
-		if (writev(ts->output.fd, iov, 2) < 0) {
+		do {
+			written = writev(ts->output.fd, iov, 2);
+		} while (written < 0 && errno == EINTR);
+		if (written != (ssize_t)(sizeof(rtp_header) + data_size)) {
+			if (written >= 0)
+				errno = EIO;
 			perror("writev(output_fd)");
-			return;
+			return -1;
 		}
 	}
+	return 0;
 }
 
 void *write_thread(void *_ts) {

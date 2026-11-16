@@ -47,6 +47,7 @@ TS_DIR = libtsfuncs
 TS_LIB = $(TS_DIR)/libtsfuncs.a
 
 tsdecrypt_SRC = data.c \
+ input-shift.c \
  csa.c \
  udp.c \
  util.c \
@@ -82,9 +83,9 @@ CLEAN_OBJS = $(FFDECSA_OBJ) tsdecrypt $(tsdecrypt_SRC:.c=.o) $(tsdecrypt_SRC:.c=
 
 PROGS = tsdecrypt
 
-.PHONY: ffdecsa dvbcsa help distclean clean install uninstall
+.PHONY: all ffdecsa dvbcsa help distclean clean install uninstall check check-shift test
 
-all: ffdecsa
+all: tsdecrypt
 
 ffdecsa: clean
 	$(Q)echo "Using FFdecsa as decryption library"
@@ -137,13 +138,26 @@ distclean: clean
 	$(Q)$(MAKE) -s -C $(FUNCS_DIR) clean
 	$(Q)$(RM) FFdecsa.opts
 
-install: all
+install: tsdecrypt
 	@install -d "$(INSTALL_PRG_DIR)"
 	@install -d "$(INSTALL_DOC_DIR)"
 	@echo "INSTALL $(INSTALL_PRG) -> $(INSTALL_PRG_DIR)"
 	$(Q)-install $(INSTALL_PRG) "$(INSTALL_PRG_DIR)"
 	@echo "INSTALL $(INSTALL_DOC) -> $(INSTALL_DOC_DIR)"
 	$(Q)-install --mode 0644 $(INSTALL_DOC) "$(INSTALL_DOC_DIR)"
+	$(Q)install -d "$(DESTDIR)$(PREFIX)/share/doc/tsdecrypt/docs"
+	$(Q)install -m644 README.md CHANGELOG.md COPYING "$(DESTDIR)$(PREFIX)/share/doc/tsdecrypt/"
+	$(Q)install -m644 docs/*.md "$(DESTDIR)$(PREFIX)/share/doc/tsdecrypt/docs/"
+	$(Q)install -m644 libfuncs/LICENSE-MIT.txt "$(DESTDIR)$(PREFIX)/share/doc/tsdecrypt/libfuncs-LICENSE-MIT.txt"
+	$(Q)install -m644 libtsfuncs/LICENSE-MIT.txt "$(DESTDIR)$(PREFIX)/share/doc/tsdecrypt/libtsfuncs-LICENSE-MIT.txt"
+
+check:
+	$(Q)./tests/run-cs378x-control-test.sh
+	$(Q)sh tests/run-input-shift-test.sh
+
+check-shift: tsdecrypt
+	$(Q)sh tests/run-input-shift-test.sh
+	$(Q)python3 tests/input_shift_integration.py
 
 uninstall:
 	@-for FILE in $(INSTALL_PRG); do \
@@ -154,6 +168,8 @@ uninstall:
 		echo "RM       $(INSTALL_DOC_DIR)/$$FILE"; \
 		rm "$(INSTALL_DOC_DIR)/$$FILE"; \
 	done
+
+	@rm -rf -- "$(DESTDIR)$(PREFIX)/share/doc/tsdecrypt"
 
 help:
 	$(Q)echo -e "\
@@ -175,3 +191,6 @@ Cleaning targets:\n\
 \n\
   make V=1          Enable verbose build\n\
   make PREFIX=dir   Set install prefix\n"
+
+test: check-shift
+	$(Q)./tests/run-cs378x-control-test.sh

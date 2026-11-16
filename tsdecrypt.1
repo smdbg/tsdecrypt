@@ -132,6 +132,43 @@ means that if OSCAM is unable to return code word in less than 700 ms the
 decryption will fail for a small amount of time. Setting \-\-input\-buffer 1000
 will solve the problem in this case.
 .TP
+\fB\-\-input\-shift\fR <milliseconds>
+Delay the complete incoming transport stream in RAM before parsing PSI,
+ECM or EMM and before decryption. Range 0 through 10000; default 0 disables
+the shift and retains the existing input path. Distinct shifts on services
+can move ECM request phases; the same shift on every service cannot spread
+requests. This is different from \fB\-\-input\-buffer\fR, which processes
+ECM immediately and delays only the decode path.
+Receive times use CLOCK_MONOTONIC. Blocks retain their order and receive-time
+spacing; silence and EOF do not prevent queued blocks reaching their deadlines.
+SIGTERM stops promptly without replaying the remaining queue. PCR, PTS,
+EPG and other TS payloads are not changed by the shift.
+.TP
+\fB\-\-input\-shift\-memory\fR <bytes>
+Required when the input shift is nonzero. Hard cap for this process's shift
+queue, including its metadata. A single anonymous memory mapping is rounded
+down to the system page size; at least 4096 bytes are required (and at least
+one system page). This cap is additional to ordinary decoder memory. When
+running multiple instances, allocate their individual limits explicitly.
+Queue overflow is an explicit error with a nonzero exit status, never a
+silent overwrite. Select capacity for peak input bitrate and delay, including
+metadata and short UDP datagrams. No stream data is written to disk.
+.TP
+\fB\-\-input\-shift\-status\fR <filename>
+Write an atomic JSON snapshot initially, every ten seconds, and on termination.
+Use a tmpfs path such as /dev/shm to avoid telemetry disk writes. Counters include
+allocated and occupied bytes, queue blocks, overflows and maximum deadline
+lateness. A block means one received group of up to seven TS packets.
+.TP
+\fB\-\-input\-passthrough\fR
+Forward the complete input TS unchanged, without CAMD connections, PSI parsing,
+PID filtering or decryption. Useful for applying input shift to clear streams.
+Compatible with UDP or stdin input; arbitrary short pipe reads are assembled
+into complete 188-byte packets. Input and output can explicitly use a dash
+for stdin and stdout. Rejects decode-buffer, constant-CW and EMM-processing
+options. UDP input must contain at most seven complete TS packets; RTP input
+supports the existing fixed 12-byte MPEG-TS header without extensions or CSRCs.
+.TP
 \fB\-W\fR, \fB\-\-input\-dump\fR <filename>
 Save input stream in <filename>. If the input is RTP, the file will contain
 the data without RTP headers (pure mpeg transport stream). Easiest way to
